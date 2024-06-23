@@ -1,16 +1,26 @@
 import 'dart:io';
 
 import 'package:args/args.dart';
+import 'package:cloudflare_dyn_dns/cache.dart';
 import 'package:cloudflare_dyn_dns/cloudflare.dart';
 import 'package:cloudflare_dyn_dns/config.dart';
 import 'package:collection/collection.dart';
 import 'package:http/http.dart';
+import 'package:path/path.dart' as p;
 import 'package:yaml/yaml.dart';
 
 Future<void> main(List<String> args) async {
   // Parse args
   final parser = ArgParser()
-    ..addFlag('help', abbr: 'h', help: 'Displays this help information.')
+    ..addFlag('help',
+        abbr: 'h', help: 'Displays this help information.', negatable: false)
+    ..addFlag('skip-cache',
+        abbr: 's',
+        help:
+            'Ignore IP cache file. By default, Cloudflare API calls will be avoided '
+            'if public IPs did not change since the last time this program was ran.',
+        defaultsTo: false,
+        negatable: false)
     ..addOption('config', abbr: 'c', help: 'Configuration file (required).');
 
   final argResults = parser.parse(args);
@@ -25,6 +35,16 @@ Future<void> main(List<String> args) async {
     print('Options:');
     print(parser.usage);
     return;
+  }
+
+  // Read cache file
+  final bool skipCache = argResults['skip-cache'];
+  final IpCache cache;
+
+  if (!skipCache) {
+    cache = await getIpCache();
+  } else {
+    cache = IpCache.empty();
   }
 
   // Read config file
@@ -72,6 +92,11 @@ Future<void> main(List<String> args) async {
       ipv6 = null;
     }
 
+    if (cache.ipv4 == ipv4 && cache.ipv6 == ipv6) {
+      print('IP(s) have not changed since last run.');
+      exit(0);
+    }
+
     // Get existing DNS records
     final records = await client.listDnsRecords(config.zoneId);
 
@@ -99,7 +124,7 @@ Future<void> main(List<String> args) async {
           content: ip,
         );
         print('Created DNS record: ${record.type} ${record.name} -> $ip');
-      } else {
+      } else if (existing.content != ip) {
         await client.updateDnsRecord(
           config.zoneId,
           id: existing.id,
@@ -108,7 +133,16 @@ Future<void> main(List<String> args) async {
           content: ip,
         );
         print('Updated DNS record: ${existing.type} ${existing.name} -> $ip');
+      } else {
+        print(
+            'DNS record: ${existing.type} ${existing.name} $ip already up-to-date.');
       }
+    }
+
+    // Update cache file
+    if (!skipCache) {
+      final cachePath = await writeIpCache(ipv4: ipv4, ipv6: ipv6);
+      print('Caching IP(s) at ${p.absolute(cachePath)}');
     }
   } on CloudflareException catch (ex) {
     stderr.writeln(ex.message);
